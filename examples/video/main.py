@@ -15,6 +15,7 @@ import dash_bootstrap_components as dbc
 import dash_html_components as html
 from vizy import Vizy, Perspective
 from kritter.ktextvisor import KtextVisor, KtextVisorTable, Image
+from fractions import Fraction
 
 
 FOCAL_LENGTH = 2260 # measured in pixels, needed for perspective change
@@ -40,8 +41,8 @@ class Video:
 
         # Create remaining controls for mode, brightness, framerate, and white balance. 
         mode = kritter.Kdropdown(name='Camera mode', options=self.camera.getmodes(), value=self.camera.mode, style=style)
-        brightness = kritter.Kslider(name="Brightness", value=self.camera.brightness, mxs=(0, 100, 1), format=lambda val: f'{val}%', style=style)
-        self.shutter = kritter.Kslider(name="Shutter-speed", value=self.camera.shutter_speed, mxs=(.0001, 1/self.camera.framerate, .0001), format=lambda val: f'{val:.4f} s', style=style)
+        brightness = kritter.Kslider(name="Brightness", value=self.camera.brightness, mxs=(0, 100, 1), format=lambda val: f'{val}%', style=style) 
+        self.shutter = kritter.Kslider(name="Shutter-speed", value=self.camera.shutter_speed, mxs=(.0001, 1/self.camera.framerate, .0001), format=lambda val: f'{Fraction(*val.as_integer_ratio()).limit_denominator()}', style=style)
         self.framerate = kritter.Kslider(name="Framerate", value=self.camera.framerate, format=lambda val : f'{val:.2f} fps', updatemode='mouseup', style=style)
         self.framerate.focused = False # Start out in unfocused mode for framerate
         autoshutter = kritter.Kcheckbox(name='Auto-shutter', value=self.camera.autoshutter, style=style)
