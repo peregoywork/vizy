@@ -1,3 +1,6 @@
 
 apps/motionscope/media/test.data
 apps/motionscope/media/test.raw
+
+build/
+src/
