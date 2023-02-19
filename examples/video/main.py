@@ -42,6 +42,7 @@ class Video:
         # Create remaining controls for mode, brightness, framerate, and white balance. 
         mode = kritter.Kdropdown(name='Camera mode', options=self.camera.getmodes(), value=self.camera.mode, style=style)
         brightness = kritter.Kslider(name="Brightness", value=self.camera.brightness, mxs=(0, 100, 1), format=lambda val: f'{val}%', style=style) 
+        # TODO: change speed to 5 - 1/1000 --> slow to high
         self.shutter = kritter.Kslider(name="Shutter-speed", value=self.camera.shutter_speed, mxs=(.0001, 1/self.camera.framerate, .0001), format=lambda val: f'{Fraction(*val.as_integer_ratio()).limit_denominator()}', style=style)
         self.framerate = kritter.Kslider(name="Framerate", value=self.camera.framerate, format=lambda val : f'{val:.2f} fps', updatemode='mouseup', style=style)
         self.framerate.focused = False # Start out in unfocused mode for framerate
