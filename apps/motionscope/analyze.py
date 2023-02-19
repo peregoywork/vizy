@@ -16,6 +16,7 @@ import json
 import collections
 from threading import RLock
 from tab import Tab
+import dash_html_components as html
 from quart import redirect, send_file
 import kritter
 from kritter import Gcloud
@@ -27,6 +28,7 @@ from pandas import DataFrame
 
 GRAPH_UPDATE_TIMEOUT = 0.15
 EXPORT_FILENAME = "motionscope_data"
+MAX_OBJECTS = len(kritter.get_color.colors) # For now we only display as many objects as we have colors
 REDIRECT_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -54,7 +56,6 @@ class Analyze(Tab):
         self.matrix = np.identity(3, dtype="float32")
         self.stream = main.camera.stream()
         self.perspective = main.perspective
-        self.media_dir = main.media_dir
         self.lock = RLock()
         self.graph_update_timer = kritter.FuncTimer(GRAPH_UPDATE_TIMEOUT)
         self.data_spacing_map = {}
@@ -68,37 +69,53 @@ class Analyze(Tab):
         self.spacing_c = kritter.Kslider(name="Spacing", mxs=(1, 10, 1), updaterate=6, style=style)
         self.time_c = kritter.Kslider(name="Time", range=True, mxs=(0, 10, 1), updaterate=6, style=style)
 
-        self.settings_map = {"spacing": self.spacing_c.out_value, "time": self.time_c.out_value}
+        self.settings_map = {"spacing": self.spacing_c.out_value, "time": self.time_c.out_value, "obj_render": self.update_obj_render}
         self.graphs = Graphs(self.kapp, self.data, self.data_spacing_map, self.settings_map, self.lock, self.main.video, self.main.config_consts.GRAPHS, style) 
         options = [dbc.DropdownMenuItem(k, id=self.kapp.new_id(), href="export/"+v[0], target="_blank", external_link=True) for k, v in self.export_map.items()]
         # We don't want the export funcionality to be shared! (service=None)
         self.export = kritter.KdropdownMenu(name="Export data", options=options, service=None)
-        
-        self.layout = dbc.Collapse([self.spacing_c, self.time_c] + self.graphs.controls_layout + [self.export], id=self.kapp.new_id())
+        self.obj_box_ids = [self.kapp.new_id() for i in range(MAX_OBJECTS)]
+        self.obj_checkboxes = [kritter.Kcheckbox(name=html.Div(html.Div(id=self.obj_box_ids[i])), style=style, disp=False) for i in range(MAX_OBJECTS)]
+
+        self.layout = dbc.Collapse([self.spacing_c, self.time_c] + self.graphs.controls_layout + self.obj_checkboxes + [self.export], id=self.kapp.new_id())
+
+        def checkbox_func(index):
+            def func(val):
+                objs = list(self.sorted_obj_data.keys())
+                if  self.data[self.name]["obj_render"][objs[index]]!=val:
+                    self.data[self.name]["obj_render"][objs[index]] = val
+                    # reset composite frame
+                    self.curr_render_index_map = self.zero_index_map.copy()
+                    self.next_render_index_map = self.zero_index_map.copy()
+                    self.pre_frame = self.data['bg'].copy()
+                    self.render()
+            return func 
+        for i in range(MAX_OBJECTS):
+            self.obj_checkboxes[i].callback()(checkbox_func(i))
 
         @self.kapp.server.route("/export/<path:form>")
         async def export(form):
             try:
-                filename = EXPORT_FILENAME if 'project' not in self.data else self.data['project']
+                filename = EXPORT_FILENAME if self.main.project is None else self.main.project
                 if form=="table":
                     data = self.data_frame()
                     return data.to_html(na_rep="", index=False, justify="left")
                 elif form=="csv":
                     data = self.data_frame()
                     filename = f"{filename}.csv"
-                    filepath = os.path.join(self.media_dir, filename)
+                    filepath = os.path.join(self.main.current_project_dir, filename)
                     data.to_csv(filepath, na_rep="", index=False)
                     return await send_file(filepath, cache_timeout=0, as_attachment=True, attachment_filename=filename)
                 elif form=="xlsx":
                     data = self.data_frame()
                     filename = f"{filename}.xlsx"
-                    filepath = os.path.join(self.media_dir, filename)
+                    filepath = os.path.join(self.main.current_project_dir, filename)
                     data.to_excel(filepath, na_rep="", index=False)
                     return await send_file(filepath, cache_timeout=0, as_attachment=True, attachment_filename=filename)
                 elif form=="json":
                     data = self.data_dict()
                     filename = f"{filename}.json"
-                    filepath = os.path.join(self.media_dir, filename)
+                    filepath = os.path.join(self.main.current_project_dir, filename)
                     with open(filepath, "w") as file:
                         json.dump(data, file)
                     return await send_file(filepath, cache_timeout=0, as_attachment=True, attachment_filename=filename)
@@ -110,8 +127,8 @@ class Analyze(Tab):
                     return REDIRECT_PAGE.format(url)  
                 else:
                     return "Data format not supported."
-            except:
-                return "No data available..."
+            except Exception as e:
+                return f"No data available. ({e})"
         
         # This gets called when our perspective matrix changes
         @self.perspective.callback_change()
@@ -137,6 +154,12 @@ class Analyze(Tab):
             self.curr_first_index, self.curr_last_index = val
             self.render()
 
+    def update_obj_render(self, obj_render_map):
+        mods = []
+        for i, v in enumerate(obj_render_map.values()):
+            mods += self.obj_checkboxes[i].out_value(v)
+        return mods 
+
     def export_gtable(self, filename):
         filename += " (MotionScope)"
         data = self.data_frame()
@@ -145,7 +168,7 @@ class Analyze(Tab):
             self.gtabular.clear(sheet)
             self.gtabular.append_data(sheet, data)
         else:
-            sheet = self.gtabular.create(filename,data)
+            sheet = self.gtabular.create(filename, data)
         return self.gtabular.get_url(sheet)
 
     def data_frame(self):
@@ -177,7 +200,7 @@ class Analyze(Tab):
             ptss = []
             indexes = []
             self.data_index_map = collections.defaultdict(dict)
-            for k, data in self.data['obj_data'].items():
+            for k, data in self.sorted_obj_data.items():
                 max_points.append(len(data))
                 ptss = np.append(ptss, data[:, 0])  
                 indexes = np.append(indexes, data[:, 1]).astype(int)
@@ -220,6 +243,10 @@ class Analyze(Tab):
                 merge_data(self.data_spacing_map, self.data_index_map[i])
                 t0 = t
 
+        # Remove objects we aren't supposed to render
+        for k, v in self.data[self.name]["obj_render"].items():
+            if not v:
+                del self.data_spacing_map[k]
         self.transform_and_crop(self.data_spacing_map)
 
     def compose_frame(self, index, val):
@@ -230,7 +257,8 @@ class Analyze(Tab):
             frame = self.data['bg']
         dd = self.data_index_map[index]  
         for k, d in dd.items():
-            self.pre_frame[int(d[5]):int(d[5]+d[7]), int(d[4]):int(d[4]+d[6]), :] = frame[int(d[5]):int(d[5]+d[7]), int(d[4]):int(d[4]+d[6]), :]
+            if self.data[self.name]["obj_render"][k]: # only render if it's enabled in obj_render_map
+                self.pre_frame[int(d[5]):int(d[5]+d[7]), int(d[4]):int(d[4]+d[6]), :] = frame[int(d[5]):int(d[5]+d[7]), int(d[4]):int(d[4]+d[6]), :]
 
     def compose(self):
         next_values = list(self.next_render_index_map.values())
@@ -260,6 +288,17 @@ class Analyze(Tab):
         self.curr_render_index_map = self.next_render_index_map
         self.curr_frame = self.pre_frame.copy()
 
+    def handle_legend(self):
+        mods = []
+        objs = list(self.sorted_obj_data.keys())
+        for i in range(MAX_OBJECTS):
+            if i<len(self.sorted_obj_data):
+                mods += self.obj_checkboxes[i].out_disp(True) + self.obj_checkboxes[i].out_value(True)
+                mods += [Output(self.obj_box_ids[i], "style", {"float": "right", "width": "20px", "height": "20px", "background-color": kritter.get_color(int(objs[i]), html=True)})]
+            else:
+                mods += self.obj_checkboxes[i].out_disp(False)
+        return mods 
+            
     def render(self):
         if not self.data_index_map:
             return
@@ -289,13 +328,25 @@ class Analyze(Tab):
                 t0 = self.time_list[0] + self.frame_period*(val[0]-self.indexes[0])
                 t1 = self.time_list[0] + self.frame_period*(val[1]-self.indexes[0])
                 return f'{t0:.3f}s → {t1:.3f}s'
+
+            # Sort object data by objects with the most data first
+            self.sorted_obj_data = dict(sorted(self.data['obj_data'].items(), reverse=True, key=lambda item: len(item[1])))
+            # Change key of objects to be integers counting 0, 1, 2, ...
+            self.sorted_obj_data = {i:v for i, (k, v) in enumerate(self.sorted_obj_data.items())}
+            # Initial object render map is all objects are rendered
+            self.data[self.name]["obj_render"] = {i: True for i in self.sorted_obj_data}
+            # Remove off the end of the object data if there are too many objects
+            while len(self.sorted_obj_data)>MAX_OBJECTS:
+                objs = list(self.sorted_obj_data.keys())
+                del self.sorted_obj_data[objs[-1]]
+
             self.pre_frame = self.data['bg'].copy()
             self.spacing = 1
             self.precompute()
             self.time_c.set_format(time_format)
             # Send mods off because they might conflict with mods self.name, and 
             # calling push_mods forces calling render() early. 
-            self.kapp.push_mods(self.spacing_c.out_max(self.max_points//3) + self.spacing_c.out_value(self.spacing) + self.time_c.out_min(self.indexes[0]) + self.time_c.out_max(self.indexes[-1]) + self.time_c.out_value((self.curr_first_index, self.curr_last_index)))
+            self.kapp.push_mods(self.spacing_c.out_max(self.max_points//3) + self.spacing_c.out_value(self.spacing) + self.time_c.out_min(self.indexes[0]) + self.time_c.out_max(self.indexes[-1]) + self.time_c.out_value((self.curr_first_index, self.curr_last_index)) + self.handle_legend())
 
         if self.name in changed:
             self.settings_update(settings)
@@ -308,7 +359,8 @@ class Analyze(Tab):
                 self.data_spacing_map.clear()
             except:
                 pass
-            return self.graphs.reset() + self.settings_update(self.main.config_consts.DEFAULT_ANALYZE_SETTINGS)
+            mods = self.graphs.reset()
+        return mods + self.settings_update(self.main.config_consts.DEFAULT_ANALYZE_SETTINGS)
 
     def frame(self):
         self.graphs.update()

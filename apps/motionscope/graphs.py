@@ -409,15 +409,15 @@ class Graphs():
                 else:
                     ax = -6
                     xanchor = 'right'
-                self.video.overlay_annotations.append(dict(x=x, y=y, xref="x", yref="y", text=text, font=dict(color="white"), borderpad=3, showarrow=True, ax=ax, ay=0, xanchor=xanchor, arrowcolor="black", bgcolor=obj_color, bordercolor="white", id=self.id))
+                self.video.overlay.annotations.append(dict(x=x, y=y, xref="x", yref="y", text=text, font=dict(color="white"), borderpad=3, showarrow=True, ax=ax, ay=0, xanchor=xanchor, arrowcolor="black", bgcolor=obj_color, bordercolor="white", id=self.id))
 
         return self.video.overlay.out_draw() 
 
     def out_draw(self, highlight=None):
         if not self.spacing_map:
-            return []
+            return self.out_disp(False)
         with self.lock:
-            mods = self.out_draw_video(highlight)
+            mods = self.out_disp(True) + self.out_draw_video(highlight)
             for i, g in enumerate(self.selections):
                 desc = self.graph_descs[g]
                 for j in range(2):

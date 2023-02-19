@@ -14,11 +14,12 @@ from kritter import Kritter, import_config
 import kritter
 import time
 import json
+import glob
 import collections
 from dash_devices.dependencies import Input, Output
 import dash_bootstrap_components as dbc
 import dash_html_components as html
-from vizy import Vizy, Perspective
+from vizy import Vizy, Perspective, OpenProjectDialog, NewProjectDialog, ExportProjectDialog, ImportProjectDialog
 import vizy.vizypowerboard as vpb
 from camera import Camera 
 from capture import Capture
@@ -49,111 +50,12 @@ data:
 
 CONSTS_FILE = "motionscope_consts.py"
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
-MEDIA_DIR = os.path.join(APP_DIR, "media")
+DATA_FILE = "data.json"
+VIDEO_FILE = "video.raw"
 
+GDRIVE_DIR = "/vizy/motionscope"
+SHARE_KEY_TYPE = "MSPG" # MotionScope Project, Google Drive
 
-def get_projects():
-    projects = os.listdir(MEDIA_DIR)
-    projects = [p.split(".")[0] for p in projects]
-    projects = set(projects)
-    projects = [p for p in projects if os.path.exists(os.path.join(MEDIA_DIR, f"{p}.data"))]
-    projects.sort()
-    return projects
-
-class SaveAsDialog(kritter.Kdialog):
-    def __init__(self):
-        self.name = ''
-        self.callback_func = None
-        name = kritter.KtextBox(placeholder="Enter project name")
-        save_button = kritter.Kbutton(name=[Kritter.icon("save"), "Save"], disabled=True)
-        overwite_text = kritter.Ktext(style={"control_width": 12})
-        yesno = kritter.KyesNoDialog(title="Overwrite project?", layout=overwite_text, shared=True)
-        name.append(save_button)
-        super().__init__(title="Save project as", close_button=[Kritter.icon("close"), "Cancel"], layout=[name, yesno], shared=True)
-
-        @self.callback_view()
-        def func(state):
-            if not state:
-                return name.out_value("")
-
-        @name.callback()
-        def func(val):
-            if val:
-                self.name = val
-            return save_button.out_disabled(not bool(val))
-
-        @save_button.callback()
-        def func():
-            projects = get_projects()
-            if self.name in projects:
-                return overwite_text.out_value(f'"{self.name}" exists. Do you want to overwrite?') + yesno.out_open(True)                
-            self.kapp.push_mods(self.out_open(False))
-            if self.callback_func:
-                self.callback_func(self.name)
-
-        @yesno.callback_response()
-        def func(val):
-            if val:
-                self.kapp.push_mods(self.out_open(False))
-                if self.callback_func:
-                    self.callback_func(self.name)
-
-    def callback_name(self):
-        def wrap_func(func):
-            self.callback_func = func
-        return wrap_func
-
-
-class OpenProjectDialog(kritter.Kdialog):
-    def __init__(self):
-        self.selection = ''
-        self.callback_func = None
-        open_button = kritter.Kbutton(name=[Kritter.icon("folder-open"), "Open"], disabled=True)
-        delete_button = kritter.Kbutton(name=[Kritter.icon("trash"), "Delete"], disabled=True)
-        delete_text = kritter.Ktext(style={"control_width": 12})
-        yesno = kritter.KyesNoDialog(title="Delete project?", layout=delete_text, shared=True)
-        select = kritter.Kdropdown(value=None, placeholder="Select project...")
-        select.append(open_button)
-        select.append(delete_button)
-        super().__init__(title="Open project", layout=[select, yesno], shared=True)
-
-        @self.callback_view()
-        def func(state):
-            if state:
-                projects = get_projects()
-                return select.out_options(projects)
-            else:
-                return select.out_value(None)
-
-        @select.callback()
-        def func(selection):
-            self.selection = selection
-            disabled = not bool(selection)
-            return open_button.out_disabled(disabled) + delete_button.out_disabled(disabled)
-
-        @open_button.callback()
-        def func():
-            if self.callback_func:
-                self.callback_func(self.selection)
-            return self.out_open(False)
-
-        @delete_button.callback()
-        def func():
-            return delete_text.out_value(f'Are you sure you want to delete "{self.selection}" project?') + yesno.out_open(True)
-
-        @yesno.callback_response()
-        def func(val):
-            if val:
-                os.remove(os.path.join(MEDIA_DIR, f"{self.selection}.data"))
-                os.remove(os.path.join(MEDIA_DIR, f"{self.selection}.raw"))
-                projects = get_projects()
-                return select.out_options(projects)
-
-
-    def callback_project(self):
-        def wrap_func(func):
-            self.callback_func = func
-        return wrap_func
 
 
 # Do a nested dictionary update
@@ -166,16 +68,19 @@ def deep_update(d1, d2):
 
 class MotionScope:
 
-    def __init__(self, media_dir):
-        self.media_dir = media_dir
-        if not os.path.isdir(self.media_dir):
-            os.system(f"mkdir -p {self.media_dir}")
+    def __init__(self):
         self.data = collections.defaultdict(dict)
         self.kapp = Vizy()
+        self.project_dir = os.path.join(self.kapp.etcdir, "motionscope")
+        self.current_project_dir = self.project_dir    
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir)
         consts_filename = os.path.join(APP_DIR, CONSTS_FILE) 
         self.config_consts = import_config(consts_filename, self.kapp.etcdir, ["WIDTH", "PADDING", "GRAPHS", "MAX_RECORDING_DURATION", "START_SHIFT", "MIN_RANGE", "PLAY_RATE", "UPDATE_RATE", "FOCAL_LENGTH", "BG_AVG_RATIO", "BG_CNT_FINAL", "EXT_BUTTON_CHANNEL", "DEFAULT_CAMERA_SETTINGS", "DEFAULT_CAPTURE_SETTINGS", "DEFAULT_PROCESS_SETTINGS", "DEFAULT_ANALYZE_SETTINGS"])     
         self.lock = RLock()
         self.vpb = vpb.VizyPowerBoard()
+
+        self.gdrive = kritter.Gcloud(self.kapp.etcdir).get_interface("KfileClient")
 
         # Create and start camera.
         self.camera = kritter.Camera(hflip=True, vflip=True)
@@ -195,11 +100,15 @@ class MotionScope:
             t.id_nav = self.kapp.new_id()    
         self.tab = self.camera_tab
 
-        self.file_options_map = {"open": dbc.DropdownMenuItem([Kritter.icon("folder-open"), "Open..."], disabled=True), "save": dbc.DropdownMenuItem([Kritter.icon("save"), "Save"], disabled=True), "save-as": dbc.DropdownMenuItem([Kritter.icon("save"), "Save as..."]), "close": dbc.DropdownMenuItem([Kritter.icon("folder"), "Close"], disabled=True)}
+        self.file_options_map = {
+            "open": dbc.DropdownMenuItem([Kritter.icon("folder-open"), "Open..."], disabled=True), 
+            "save": dbc.DropdownMenuItem([Kritter.icon("save"), "Save"], disabled=True), 
+            "save-as": dbc.DropdownMenuItem([Kritter.icon("save"), "Save as..."]), 
+            "import": dbc.DropdownMenuItem([kritter.Kritter.icon("sign-in"), "Import..."]), 
+            "export": dbc.DropdownMenuItem([kritter.Kritter.icon("sign-out"), "Export..."], disabled=True), 
+            "close": dbc.DropdownMenuItem([Kritter.icon("folder"), "Close"], disabled=True)}
         self.file_menu = kritter.KdropdownMenu(name="File", options=list(self.file_options_map.values()), nav=True, item_style={"margin": "0px", "padding": "0px 10px 0px 10px"})
-        self.sa_dialog = SaveAsDialog()
-        self.open_dialog = OpenProjectDialog()
-
+ 
         nav_items = [dbc.NavItem(dbc.NavLink(t.name, active=i==0, id=t.id_nav, disabled=t.name=="Process" or t.name=="Analyze")) for i, t in enumerate(self.tabs)]
         nav_items.append(self.file_menu.control)
         nav = dbc.Nav(nav_items, pills=True, navbar=True)
@@ -222,35 +131,11 @@ class MotionScope:
                     html.Div(self.analyze_tab.graphs.layout)
                 ], style={"padding": f"{self.config_consts.PADDING}px"})
             # Next Div is scrollable, occupies all of available viewport.    
-            ], style={"overflow": "auto"})
+            ], style={"overflow": "auto", "height": "100%"})
         # Outermost Div is flexbox 
         ], style={"display": "flex", "height": "100%", "flex-direction": "column"})
 
-        self.kapp.layout = [controls_layout, self.save_progress_dialog, self.load_progress_dialog, self.sa_dialog, self.open_dialog]
-
-        @self.open_dialog.callback_project()
-        def func(project):
-            # Display load progress dialog to give user feedback.  
-            self.kapp.push_mods(self.load_progress_dialog.out_progress(0) + self.load_progress_dialog.out_open(True))
-            # Reset state of application to make sure no remnant settings are left behind.
-            self.kapp.push_mods(self.reset())
-            self.set_project(project)
-            filename = os.path.join(self.media_dir, f"{self.data['project']}.raw")
-            exists = os.path.exists(filename)
-            self.run_progress = True
-            # Create recording object (save_load_progress needs it)
-            if exists:
-                self.data['recording'] = self.camera.stream(False)
-            Thread(target=self.save_load_progress, args=(self.load_progress_dialog, )).start()
-            # Load (this blocks)
-            if exists:
-                self.data['recording'].load(filename)
-            self.run_progress = False
-
-        @self.sa_dialog.callback_name()
-        def func(name):
-            self.set_project(name)
-            self.save()
+        self.kapp.layout = [controls_layout, self.save_progress_dialog, self.load_progress_dialog, self._create_saveas_dialog(), self._create_open_dialog(), self._create_import_dialog(), self._create_export_dialog()]
 
         @self.file_menu.callback()
         def func(val):
@@ -262,8 +147,12 @@ class MotionScope:
                 self.save()
                 return
             elif ss=="save-as": 
-                return self.sa_dialog.out_open(True)
-            else: # ss=="close":
+                return self.saveas_dialog.out_open(True)
+            elif ss=="export":
+                return self.export_dialog.out_open(True)
+            elif ss=="import":
+                return self.import_dialog.out_open(True)
+            elif ss=="close":
                 return self.reset()
 
         for t in self.tabs:
@@ -288,8 +177,84 @@ class MotionScope:
         self.kapp.run()
         self.run_thread = False
 
+    def _create_saveas_dialog(self):
+        self.saveas_dialog = NewProjectDialog(self.get_projects, title=[kritter.Kritter.icon("folder"), "Save project as"], overwritable=True)
+
+        @self.saveas_dialog.callback_project()
+        def func(project):
+            self.set_project(project)
+            self.save()
+
+        return self.saveas_dialog
+
+
+    def _create_open_dialog(self):
+        self.open_dialog = OpenProjectDialog(self.get_projects)
+
+        @self.open_dialog.callback_project()
+        def func(project, delete):
+            if delete:
+                os.system(f"rm -rf '{os.path.join(self.project_dir, project)}'")
+            else:
+                self.open_project(project)
+
+        return self.open_dialog
+
+    def _create_import_dialog(self):
+        self.import_dialog = ImportProjectDialog(self.gdrive, self.project_dir, SHARE_KEY_TYPE)
+
+        @self.import_dialog.callback()
+        def func(project_name):
+            # open imported project
+            self.open_project(project_name)
+
+        return self.import_dialog
+
+    def _create_export_dialog(self):
+        def file_info_func():
+            return {
+                "project_name": self.project, 
+                "project_dir": self.current_project_dir, 
+                "files": [DATA_FILE, VIDEO_FILE], 
+                "gdrive_dir": GDRIVE_DIR
+            }
+
+        self.export_dialog = ExportProjectDialog(self.gdrive, SHARE_KEY_TYPE, file_info_func)
+
+        return self.export_dialog
+
+    def get_projects(self, exclude_current=False):
+        plist = glob.glob(os.path.join(self.project_dir, '*', DATA_FILE))
+        plist = [os.path.basename(os.path.dirname(i)) for i in plist]
+        if exclude_current:
+            try:
+                plist.remove(self.project)
+            except:
+                pass
+        plist.sort(key=str.lower)
+        return plist
+
+    def open_project(self, project):
+        # Display load progress dialog to give user feedback.  
+        self.kapp.push_mods(self.load_progress_dialog.out_progress(0) + self.load_progress_dialog.out_open(True))
+        # Reset state of application to make sure no remnant settings are left behind.
+        self.kapp.push_mods(self.reset())
+        self.set_project(project)
+        filename = os.path.join(self.current_project_dir, VIDEO_FILE)
+        exists = os.path.exists(filename)
+        self.run_progress = True
+        # Create recording object (save_load_progress needs it)
+        if exists:
+            self.data['recording'] = self.camera.stream(False)
+        Thread(target=self.save_load_progress, args=(self.load_progress_dialog, )).start()
+        # Load (this blocks)
+        if exists:
+            self.data['recording'].load(filename)
+        self.run_progress = False
+
     def reset(self):
         mods = []
+        self.project = None
         # Reset tabs
         for t in self.tabs:
             mods += t.reset()
@@ -300,11 +265,12 @@ class MotionScope:
             del self.file_options_map['header']
             del self.file_options_map['divider']
             del self.data['obj_data']
-            del self.data['project']
+            del self.project
         except KeyError:
             pass
         self.file_options_map['save'].disabled = True
         self.file_options_map['close'].disabled = True
+        self.file_options_map['export'].disabled = True
         # Reset perspective and disable
         f = self.get_tab_func(self.camera_tab)
         return f(None) + [Output(self.analyze_tab.id_nav, "disabled", True), Output(self.process_tab.id_nav, "disabled", True)] + self.file_menu.out_options(list(self.file_options_map.values()))  
@@ -313,11 +279,14 @@ class MotionScope:
         self.run_progress = True
         Thread(target=self.save_load_progress, args=(self.save_progress_dialog, )).start()
         if self.data['recording'] is not None:
-            self.data['recording'].save(os.path.join(self.media_dir, f"{self.data['project']}.raw"))
+            self.data['recording'].save(os.path.join(self.current_project_dir, VIDEO_FILE))
         self.run_progress = False
 
     def set_project(self, project):
-        self.data['project'] = project
+        self.project = project
+        self.current_project_dir = os.path.join(self.project_dir, self.project)
+        if not os.path.exists(self.current_project_dir):
+            os.makedirs(self.current_project_dir)
         try:
             del self.file_options_map['header']
             del self.file_options_map['divider']
@@ -325,7 +294,8 @@ class MotionScope:
             pass
         self.file_options_map['save'].disabled = False
         self.file_options_map['close'].disabled = False
-        self.file_options_map = {**{"header": dbc.DropdownMenuItem(self.data['project'], header=True), "divider": dbc.DropdownMenuItem(divider=True)}, **self.file_options_map}
+        self.file_options_map['export'].disabled = self.gdrive is None
+        self.file_options_map = {**{"header": dbc.DropdownMenuItem(self.project, header=True), "divider": dbc.DropdownMenuItem(divider=True)}, **self.file_options_map}
         self.kapp.push_mods(self.file_menu.out_options(list(self.file_options_map.values())))
 
     def get_tab_func(self, tab):
@@ -359,7 +329,7 @@ class MotionScope:
         return mods           
 
     def load_update(self):
-        projects = get_projects() 
+        projects = self.get_projects() 
         self.file_options_map['open'].disabled = not bool(projects) 
         return self.file_menu.out_options(list(self.file_options_map.values()))
 
@@ -379,7 +349,7 @@ class MotionScope:
 
         mods = []
         # Save/load rest of data.
-        filename = os.path.join(self.media_dir, f"{self.data['project']}.data")
+        filename = os.path.join(self.current_project_dir, DATA_FILE)
         # Save
         if dialog is self.save_progress_dialog: 
             with open(filename, 'w') as f:
@@ -400,6 +370,13 @@ class MotionScope:
             try:
                 with open(filename) as f:
                     data = json.load(f, cls=kritter.JSONDecodeToNumpy)
+                # Since some projects wont have obj_render field, we reset it here so values from previous project
+                # won't corrupt this project
+                try:
+                    del self.data["Analyze"]["obj_render"]
+                except:
+                    pass
+                # We do a deep_update since we can't re-assign data (this would break data references used in other tabs)
                 deep_update(self.data, data)
 
                 # Inform tabs that we have a list of changed
@@ -439,4 +416,4 @@ class MotionScope:
 
 
 if __name__ == "__main__":
-        ms = MotionScope(MEDIA_DIR)
+        ms = MotionScope()

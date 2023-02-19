@@ -24,10 +24,11 @@ from threading import Thread, Lock
 import kritter
 from kritter import get_color
 from kritter.tflite import TFliteDetector
-from dash_devices.dependencies import Input, Output
+from dash_devices.dependencies import Input, Output, State
 import dash_html_components as html
+import dash_core_components as dcc
 import dash_bootstrap_components as dbc
-from vizy import Vizy, MediaDisplayQueue
+from vizy import Vizy, MediaDisplayQueue, OpenProjectDialog, NewProjectDialog, ImportProjectDialog, ExportProjectDialog
 from handlers import handle_event, handle_text
 from kritter.ktextvisor import KtextVisor, KtextVisorTable, Image, Video
 
@@ -51,6 +52,8 @@ PROJECT_CONFIG_FILE = "project.json"
 CONSTS_FILE = "object_detector_consts.py"
 GDRIVE_DIR = "/vizy/object_detector"
 TRAIN_FILE = "train_detector.ipynb"
+IMPORT_FILE = "import.zip"
+SHARE_KEY_TYPE = "ODPG" # Object Detector Project, Google Drive
 TRAINING_SET_FILE = "training_set.zip"
 model = "detector.tflite"
 COMMON_OBJECTS = "Common Objects"
@@ -69,7 +72,6 @@ DEFAULT_PROJECT_CONFIG = {
 }
 
 BASEDIR = os.path.dirname(os.path.realpath(__file__))
-MEDIA_DIR = os.path.join(BASEDIR, "media")
 
 
 class MediaDisplayGrid:
@@ -94,7 +96,7 @@ class MediaDisplayGrid:
         self.begin_button.append(self.end_button)
         self.begin_button.append(self.status)
 
-        self.layout = html.Div([html.Div(self.begin_button), html.Div(self._create_images())])
+        self.layout = html.Div([html.Div(self.begin_button), html.Div(self._create_images())], style={"display": "flex", "height": "100%", "flex-direction": "column"})
 
         @self.begin_button.callback()
         def func():
@@ -131,9 +133,12 @@ class MediaDisplayGrid:
                         mods = []
                         if _kimage.path.lower().endswith(".jpg"):
                             if not _kimage.data:
-                                height, width, _ = cv2.imread(_kimage.fullpath).shape
-                                _kimage.data['width'] = width  
-                                _kimage.data['height'] = height
+                                try:
+                                    height, width, _ = cv2.imread(_kimage.fullpath).shape
+                                    _kimage.data['width'] = width  
+                                    _kimage.data['height'] = height
+                                except:
+                                    pass
                             mods += self.call_callback_click(_kimage)
                         return mods
                     return func_
@@ -150,6 +155,7 @@ class MediaDisplayGrid:
         self.label_func = (lambda key, det : det['class']) if label_func is None else label_func
 
     def render(self, kimage, data, scale):
+        kimage.overlay.draw_clear()
         try:
             data = self.data_func(data)
         except:
@@ -158,7 +164,7 @@ class MediaDisplayGrid:
             kimage.overlay.update_resolution(width=data['width'], height=data['height'])
             kritter.render_detected(kimage.overlay, data['dets'], label_format=self.label_func, scale=scale)
         except:
-            kimage.overlay.draw_clear()
+            pass
         try:
             kimage.overlay.draw_text(0, data['height']-1, data['timestamp'], fillcolor="black", font=dict(family="sans-serif", size=12, color="white"), xanchor="left", yanchor="bottom")
         except:
@@ -166,6 +172,8 @@ class MediaDisplayGrid:
         return kimage.overlay.out_draw()
 
     def update_images_and_data(self):
+        if not self.media_dir:
+            return
         images = os.listdir(self.media_dir)
         images = [i for i in images if i.endswith(".jpg") or i.endswith(".mp4")]
         images.sort()
@@ -178,14 +186,14 @@ class MediaDisplayGrid:
         self.pages = (len(self.images_and_data)-1)//(self.rows*self.cols) + 1 if self.images_and_data else 0
 
     def set_media_dir(self, media_dir):
+        self.media_dir = media_dir
+        self.images_and_data = [] 
         if media_dir:
             try:
                 self.kapp.media_path.remove(self.media_dir)
             except:
                 pass
-            self.media_dir = media_dir
             self.kapp.media_path.insert(0, self.media_dir)
-            self.images_and_data = [] 
 
     def out_images(self, force_update=False):
         if not self.images_and_data or force_update:
@@ -215,7 +223,6 @@ class MediaDisplayGrid:
                 self.images[i].path = image # for URL
                 self.images[i].fullpath = os.path.join(self.media_dir, image)
                 self.images[i].data = data
-                self.images[i].overlay.draw_clear()
                 mods += self.images[i].out_src(image)
                 mods += self.render(self.images[i], data, scale=0.33)
                 mods += self.images[i].overlay.out_draw() + self.images[i].out_disp(True)
@@ -252,121 +259,58 @@ class MediaDisplayGrid:
         return wrap_func
 
 
-class OpenProjectDialog(kritter.Kdialog):
-    def __init__(self, get_projects, title=[kritter.Kritter.icon("folder-open"), "Open project"]):
-        self._get_projects = get_projects
-        self.selection = ''
+class ImportPhotosDialog(kritter.Kdialog):
+
+    def __init__(self, gphotos, dest_dir, file_func=None):
         self.callback_func = None
-        open_button = kritter.Kbutton(name=[kritter.Kritter.icon("folder-open"), "Open"], disabled=True)
-        delete_button = kritter.Kbutton(name=[kritter.Kritter.icon("trash"), "Delete"], disabled=True)
-        delete_text = kritter.Ktext(style={"control_width": 12})
-        yesno = kritter.KyesNoDialog(title="Delete project?", layout=delete_text, shared=True)
-        select = kritter.Kdropdown(value=None, placeholder="Select project...")
-        select.append(open_button)
-        select.append(delete_button)
-        super().__init__(title=title, layout=[select, yesno], shared=True)
-
-        @self.callback_view()
-        def func(state):
-            if state:
-                return select.out_options(self.get_projects(True))
-            else:
-                return select.out_value(None)
-
-        @select.callback()
-        def func(selection):
-            self.selection = selection
-            disabled = not bool(selection)
-            return open_button.out_disabled(disabled) + delete_button.out_disabled(disabled)
-
-        @open_button.callback()
-        def func():
-            mods = []
-            if self.callback_func:
-                mods += self.callback_func(self.selection, False)
-            return self.out_open(False) + mods
-
-        @delete_button.callback()
-        def func():
-            return delete_text.out_value(f'Are you sure you want to delete "{self.selection}" project?') + yesno.out_open(True)
-
-        @yesno.callback_response()
-        def func(val):
-            if val:
-                mods = []
-                if self.callback_func:
-                    mods += self.callback_func(self.selection, True)
-                projects = self.get_projects(True)
-                return select.out_options(projects) + select.out_value(None)
-
-    def get_projects(self, exclude_current=False):
-        return self._get_projects(exclude_current)
-
-    def callback_project(self):
-        def wrap_func(func):
-            self.callback_func = func
-        return wrap_func
-
-class NewSaveAsDialog(kritter.Kdialog):
-    def __init__(self, get_projects, title=[kritter.Kritter.icon("folder"), "New project"], overwritable=False):
-        self._get_projects = get_projects
-        self.name = ''
-        self.callback_func = None
-        name = kritter.KtextBox(placeholder="Enter project name")
-        save_button = kritter.Kbutton(name=[kritter.Kritter.icon("save"), "Save"], disabled=True)
-        dialog_text = kritter.Ktext(style={"control_width": 12})
-        if overwritable:
-            dialog = kritter.KyesNoDialog(title="Overwrite project?", layout=dialog_text, shared=True)
-        else:
-            dialog = kritter.KokDialog(title="Project exists", layout=dialog_text, shared=True)
-
-        name.append(save_button)
-        super().__init__(title=title, close_button=[kritter.Kritter.icon("close"), "Cancel"], layout=[name, dialog], shared=True)
+        self.file_func = file_func
+        self.dest_dir = dest_dir
+        self.gphotos = gphotos
+        self.album = kritter.KtextBox(placeholder="Type in album name")
+        self.import_button = kritter.Kbutton(name=[kritter.Kritter.icon("cloud-download"), "Import"], spinner=True, disabled=True)
+        self.album.append(self.import_button)
+        self.status = kritter.Ktext(style={"control_width": 12})
+        super().__init__(title=[kritter.Kritter.icon("cloud-download"), "Import photos"], layout=[self.album, self.status], shared=True)
 
         @self.callback_view()
         def func(state):
             if not state:
-                return name.out_value("")
+                return self.status.out_value("") + self.album.out_value("") + self.import_button.out_disabled(True)
 
-        @name.callback()
-        def func(val):
-            if val:
-                self.name = val
-            return save_button.out_disabled(not bool(val))
+        @self.album.callback()
+        def func(album):
+            return self.import_button.out_disabled(False)
 
-        @save_button.callback()
-        def func():
-            projects = self.get_projects()
-            if self.name in projects:
-                if overwritable:
-                    return dialog_text.out_value(f'"{self.name}" exists. Do you want to overwrite?') + dialog.out_open(True)
-                else:
-                    return dialog_text.out_value(f'"{self.name}" already exists.') + dialog.out_open(True)
+        def status_func(filename, m, n):
+            if self.file_func:
+                self.file_func(filename)
+            self.kapp.push_mods(self.status.out_value(f"{int(m*100/n)}% imported {filename}."))
 
-            mods = []
-            if self.callback_func:
-                mods += self.callback_func(self.name)
-            return self.out_open(False) + mods 
+        @self.import_button.callback(self.album.state_value())
+        def func(album):
+            album = album.strip()
+            self.kapp.push_mods(self.import_button.out_spinner_disp(True) + self.status.out_value(f'Searching for "{album}" in Google Photos...'))
+            dest_dir = self.dest_dir() if callable(self.dest_dir) else self.dest_dir
+            found = self.gphotos.retrieve_album(album, dest_dir, status_func)
+            self.kapp.push_mods(self.import_button.out_spinner_disp(False) + self.status.out_value("Done!" if found else f'"{album}" wasn\'t found. Note, album names are case-sensitive.'))
+            time.sleep(1)
+            mods = self.out_open(False) if found else []
+            if self.callback_func and found:
+                return mods + self.callback_func()
+            return mods
 
-        if overwritable:
-            @dialog.callback_response()
-            def func(val):
-                if val:
-                    self.kapp.push_mods(self.out_open(False))
-                    if self.callback_func:
-                        self.callback_func(self.name)
-
-    def get_projects(self, exclude_current=False):
-        return self._get_projects(exclude_current)
- 
-    def callback_project(self):
+    def callback(self):
         def wrap_func(func):
             self.callback_func = func
         return wrap_func
 
+
 def create_pvoc(filename, defs, resolution=None, out_filename=None, depth=3):
-    if not resolution: 
-        image = cv2.imread(filename)
+    if not resolution:
+        try:
+            image = cv2.imread(filename)
+        except:
+            return # File corrupt, abort
         resolution = (image.shape[1], image.shape[0])
     if not out_filename:
         out_filename = kritter.file_basename(filename)+".xml"
@@ -472,12 +416,8 @@ class ObjectDetector:
                 images_and_data = self.media_queue.get_images_and_data()
                 for image, data in images_and_data:
                     try:
-                        if image.endswith(".mp4"):
-                            res.append(f"{data['timestamp']} Video")
-                            res.append(Video(os.path.join(MEDIA_DIR, image)))
-                        else:
-                            res.append(f"{data['timestamp']} {data['class']}")
-                            res.append(Image(os.path.join(MEDIA_DIR, image)))                            
+                        res.append(f"{data['timestamp']} {data['dets'][0]['class']}")
+                        res.append(Image(os.path.join(self.media_queue.media_dir, image)))                            
                     except:
                         pass
                     else:
@@ -510,9 +450,9 @@ class ObjectDetector:
             "divider": dbc.DropdownMenuItem(divider=True), 
             "new": dbc.DropdownMenuItem([kritter.Kritter.icon("folder"), "New..."]), 
             "open": dbc.DropdownMenuItem([kritter.Kritter.icon("folder-open"), "Open..."]), 
-            "train": dbc.DropdownMenuItem([kritter.Kritter.icon("train"), "Train..."], disabled=self.gdrive_interface is None), 
-            "import_project": dbc.DropdownMenuItem([kritter.Kritter.icon("sign-in"), "Import project..."]), 
+            "train": dbc.DropdownMenuItem([kritter.Kritter.icon("train"), "Train..."]), 
             "import_photos": dbc.DropdownMenuItem([kritter.Kritter.icon("sign-in"), "Import photos..."]), 
+            "import_project": dbc.DropdownMenuItem([kritter.Kritter.icon("sign-in"), "Import project..."]), 
             "export_project": dbc.DropdownMenuItem([kritter.Kritter.icon("sign-out"), "Export project..."]), 
             "settings": dbc.DropdownMenuItem([kritter.Kritter.icon("gear"), "Settings..."])
         }
@@ -525,8 +465,10 @@ class ObjectDetector:
         nav = dbc.Nav(nav_items, pills=True, navbar=True)
         navbar = dbc.Navbar(nav, color="dark", dark=True, expand=True)
 
-        layouts = [dbc.Collapse(v, is_open=k in self.tabs[self.tab][LAYOUT], id=k+"collapse", style={"margin": "5px"}) for k, v in self.layouts.items()]
-        self.kapp.layout = [navbar] + layouts + [self._create_settings_dialog(), self._create_training_image_dialog(), self._create_test_image_dialog(), self._create_dets_image_dialog(), self._create_label_dialog(), self._create_train_dialog(), self._create_open_project_dialog(), self._create_new_project_dialog()] 
+        tab_controls = [dbc.Collapse(v, is_open=k in self.tabs[self.tab][LAYOUT], id=k+"collapse", style={"margin": "5px"}) for k, v in self.layouts.items()]
+        # Make navbar fixed at top with tab controls scrollable
+        controls_layout = html.Div([navbar, html.Div(tab_controls, style={"overflow": "auto", "height": "100%"})], style={"display": "flex", "height": "100%", "flex-direction": "column"})
+        self.kapp.layout = [controls_layout, self._create_settings_dialog(), self._create_training_image_dialog(), self._create_test_image_dialog(), self._create_dets_image_dialog(), self._create_label_dialog(), self._create_train_dialog(), self._create_export_project_dialog(), self._create_import_photos_dialog(), self._create_import_project_dialog(), self._create_open_project_dialog(), self._create_new_project_dialog()] 
         for k, v in self.tabs.items():
             try:
                 v[INIT]()
@@ -553,6 +495,12 @@ class ObjectDetector:
                 return self.train_dialog.out_open(True)
             elif option=="settings":
                 return self.settings_dialog.out_open(True)
+            elif option=="import_project":
+                return self.import_project_dialog.out_open(True)
+            elif option=="export_project":
+                return self.export_project_dialog.out_open(True)
+            elif option=="import_photos":
+                return self.import_photos_dialog.out_open(True)
 
         self.kapp.push_mods(self._open_project())
 
@@ -577,7 +525,7 @@ class ObjectDetector:
             json.dump(info, file)
 
     def _prepare(self):
-        self.kapp.push_mods(self.upload_button.out_spinner_disp(True) + self.train_button.out_disabled(True) + self.train_status.out_value("Zipping training set..."))
+        self.kapp.push_mods(self.upload_button.out_spinner_disp(True) + self.train_button.out_disabled(True) + self.train_status.out_value("Preparing files..."))
         mods = self.upload_button.out_spinner_disp(False)
         # create zip file
         os.chdir(self.current_project_dir)
@@ -597,7 +545,10 @@ class ObjectDetector:
                 defs = data['defs']
                 resolution = (data['width'], data['height'])
             except:
-                height, width, _ = cv2.imread(ff).shape
+                try:
+                    height, width, _ = cv2.imread(ff).shape
+                except:
+                    continue # File is corrupt, skip
                 defs = []
                 resolution = (width, height)
                 data = {"defs": defs, "width": width, "height": height}
@@ -612,23 +563,26 @@ class ObjectDetector:
             os.system(f"cp ../training/{f} {_dir}")
             os.system(f"cp ../training/{kritter.get_metadata_filename(f)} .meta")
         os.system(f"rm ../{TRAINING_SET_FILE}")
+        self.kapp.push_mods(self.train_status.out_value("Zipping training set..."))
         os.system(f"zip -r ../{TRAINING_SET_FILE} train validate .meta")
-        os.chdir("../..")
 
-        # modify training ipynb
-        with open(os.path.join(BASEDIR, TRAIN_FILE)) as file:
-            train_code = json.load(file)
-        project_dir = {"cell_type": "code", "source": [
-            f'PROJECT_NAME = "{self.app_config["project"]}"\n',
-            f'PROJECT_DIR = "{os.path.join("/content/drive/MyDrive", GDRIVE_DIR[1:])}/" + PROJECT_NAME'],
-            "metadata": {"id": "zXTGWX9ZWaZ9"},
-            "execution_count": 0,
-            "outputs": []
-        }
-        train_code['cells'].insert(0, project_dir)
-        train_file = os.path.join(self.current_project_dir, TRAIN_FILE)        
-        with open(train_file, "w") as file:
-            json.dump(train_code, file, indent=2)
+        # Modify training ipynb
+        train_file = os.path.join(self.current_project_dir, TRAIN_FILE)
+        # Only create the script if we don't have an existing copy, this way we don't overwrite any modifications
+        # If we want to "start-over", we can just delete
+        if not os.path.exists(train_file):        
+            with open(os.path.join(BASEDIR, TRAIN_FILE)) as file:
+                train_code = json.load(file)
+            project_dir = {"cell_type": "code", "source": [
+                f'PROJECT_NAME = "{self.app_config["project"]}"\n',
+                f'PROJECT_DIR = "{os.path.join("/content/drive/MyDrive", GDRIVE_DIR[1:])}/" + PROJECT_NAME'],
+                "metadata": {"id": "zXTGWX9ZWaZ9"},
+                "execution_count": 0,
+                "outputs": []
+            }
+            train_code['cells'].insert(0, project_dir)
+            with open(train_file, "w") as file:
+                json.dump(train_code, file, indent=2)
 
         # create classes file
         self._create_info()
@@ -639,34 +593,34 @@ class ObjectDetector:
             self.gdrive_interface.copy_to(os.path.join(self.current_project_dir, TRAINING_SET_FILE), os.path.join(self.project_gdrive_dir, TRAINING_SET_FILE), True)
         except Exception as e:
             print("Unable to upload training set images to Google Drive.", e)
-            return mods + self.train_status.out_value(f'Unable to upload training set images to Google Drive. ("{e}")')
+            return mods + self.train_status.out_value(f'Unable to upload training set images to Google Drive. ({e})')
         try:
             self.gdrive_interface.copy_to(os.path.join(self.current_project_dir, f"{self.app_config['project']}.json"), os.path.join(self.project_gdrive_dir, f"{self.app_config['project']}.json"), True)
             g_train_file = os.path.join(self.project_gdrive_dir, TRAIN_FILE)
             self.gdrive_interface.copy_to(train_file, g_train_file, True)
         except Exception as e:
             print("Unable to upload training code to Google Drive.", e)
-            return mods + self.train_status.out_value(f'Unable to upload training code to Google Drive. ("{e}")')
+            return mods + self.train_status.out_value(f'Unable to upload training code to Google Drive. ({e})')
         return mods + self._update_train_state() + self.train_status.out_value("Done! Press Train button.")
 
     def out_tab_disabled(self, tab, disabled):
         return [Output(self.tabs[tab][NAVLINK].id, "disabled", disabled)]
 
-    def _open_project(self, tab_change_allowed=True):
+    def _open_project(self):
         with self.open_lock: # Use lock since some calls of _open_project are from Dash callbacks, which have their own threads.
             mods = []
             self._close_project()
             self.current_project_dir = os.path.join(self.project_dir, self.app_config['project'])
+            self.file_options_map['header'].children = self.app_config['project']
             if not os.path.exists(self.current_project_dir):
                 os.makedirs(self.current_project_dir)
             if self.app_config['project']==COMMON_OBJECTS:
-                self.models = []
                 self.latest_model = None
                 self.project_training_dir = None
                 self.file_options_map['train'].disabled = True
                 self.file_options_map['import_photos'].disabled = True
                 self.file_options_map['export_project'].disabled = True
-                mods += self.test_model_checkbox.out_disabled(True) + self.out_tab_disabled('Capture', True) + self.out_tab_disabled('Training set', True) + self.file_menu.out_options(list(self.file_options_map.values()))
+                mods += self.test_model_checkbox.out_disabled(True) + self.out_tab_disabled('Capture', True) + self.out_tab_disabled('Training set', True)
             else:
                 self.project_models_dir = os.path.join(self.current_project_dir, "models")
                 if not os.path.exists(self.project_models_dir):
@@ -674,19 +628,22 @@ class ObjectDetector:
                 self.project_training_dir = os.path.join(self.current_project_dir, "training")
                 if not os.path.exists(self.project_training_dir):
                     os.makedirs(self.project_training_dir)
-                self.models = self.get_models()
-                self.latest_model = os.path.join(self.current_project_dir, self.models[0]) if self.models else ""
+                models = self.get_models()
+                self.model_options = [os.path.basename(m) for m in models]
+                self.latest_model = os.path.join(self.current_project_dir, models[0]) if models else ""
                 self.project_gdrive_dir = os.path.join(GDRIVE_DIR, self.app_config['project'])
                 self.project_gdrive_models_dir = os.path.join(GDRIVE_DIR, self.app_config['project'], "models")
-                self.file_options_map['train'].disabled = False
-                self.file_options_map['import_photos'].disabled = True
-                self.file_options_map['export_project'].disabled = True
-                mods += self.test_model_checkbox.out_disabled(self.latest_model=="") + self.out_tab_disabled('Capture', False) + self.out_tab_disabled('Training set', False) + self.file_menu.out_options(list(self.file_options_map.values()))
+                self.file_options_map['train'].disabled = self.gdrive_interface is None
+                self.file_options_map['import_photos'].disabled = self.gdrive_interface is None
+                self.file_options_map['export_project'].disabled = self.gdrive_interface is None
+                mods += self.test_model_checkbox.out_disabled(self.latest_model=="") + self.out_tab_disabled('Capture', False) + self.out_tab_disabled('Training set', False)
+            mods += self.file_menu.out_options(list(self.file_options_map.values()))
             self.project_dets_dir = os.path.join(self.current_project_dir, "dets")
             if not os.path.exists(self.project_dets_dir):
                 os.makedirs(self.project_dets_dir)
             config_filename = os.path.join(self.current_project_dir, PROJECT_CONFIG_FILE)
             self.project_config = kritter.ConfigFile(config_filename, DEFAULT_PROJECT_CONFIG.copy())
+            self.project_config['project_name'] = self.app_config['project']
             self.store_media = kritter.SaveMediaQueue(path=self.project_dets_dir, keep=self.config_consts.IMAGES_KEEP, keep_uploaded=self.config_consts.IMAGES_KEEP)
             if self.app_config['gphoto_upload']:
                 self.store_media.store_media = self.gphoto_interface 
@@ -711,24 +668,21 @@ class ObjectDetector:
             if self.latest_model=="":
                 self.detector_process = None
                 self.detector = None
-                if tab_change_allowed:
-                    mods += self._tab_func('Capture')
-                mods += self.out_tab_disabled('Detect', True) + self.out_tab_disabled('Detections', True) 
+                mods += self._tab_func('Capture') + self.out_tab_disabled('Detect', True) + self.out_tab_disabled('Detections', True) 
             else: # If we do have a model, enable detect tab, start process and threads.
                 self.detector_process = kritter.Processify(TFliteDetector, (self.latest_model,))
                 if self.app_config['smooth_video']:
                     self.detector = kritter.KimageDetectorThread(self.detector_process)
-                    classes = self.detector_process.classes()
                 else:
                     self.detector = self.detector_process
-                    classes = self.detector.classes()
+                classes = self.detector_process.classes()
                 if not self.project_config['enabled_classes']:
                     self.project_config['enabled_classes'] = classes
-                if tab_change_allowed:
-                    mods += self._tab_func('Detect')
-                mods += self.out_tab_disabled('Detect', False) + self.out_tab_disabled('Detections', False) + self.enabled_classes.out_options(classes)
+                mods += self._tab_func('Detect') + self.out_tab_disabled('Detect', False) + self.out_tab_disabled('Detections', False) + self.enabled_classes.out_options(classes)
 
-            return self.sensitivity.out_value(self.project_config['detection_sensitivity']) + self.model_sensitivity.out_value(self.project_config['detection_sensitivity']) + self.enabled_classes.out_value(self.project_config['enabled_classes']) + self.trigger_classes.out_options(self.project_config['enabled_classes']) + self.trigger_classes.out_value(self.project_config['trigger_classes']) + mods
+            self.project_config.save()
+
+            return self.test_model_checkbox.out_value(False) + self.sensitivity.out_value(self.project_config['detection_sensitivity']) + self.model_sensitivity.out_value(self.project_config['detection_sensitivity']) + self.enabled_classes.out_value(self.project_config['enabled_classes']) + self.trigger_classes.out_options(self.project_config['enabled_classes']) + self.trigger_classes.out_value(self.project_config['trigger_classes']) + mods
 
     def _close_project(self):
         self._stop_grab_thread()
@@ -809,7 +763,7 @@ class ObjectDetector:
         def func(value):
             self.app_config['tracking'] = value  
             self.app_config.save()
-            return self._open_project(False) + self.media_queue.out_disp(value) + upload.out_disabled(not value)
+            return self._open_project() + self.media_queue.out_disp(value) + upload.out_disabled(not value)
 
         @upload.callback()
         def func(value):
@@ -823,7 +777,7 @@ class ObjectDetector:
     def _create_dets_image_dialog(self):
         self.dets_dialog_image = kritter.Kimage(overlay=True, service=None)
         delete_button = kritter.Kbutton(name=[kritter.Kritter.icon("trash"), "Delete"], service=None)
-        copy_button = kritter.Kbutton(name=[kritter.Kritter.icon("copy"), "Copy image to training set"], service=None)
+        copy_button = kritter.Kbutton(service=None)
         copy_button.append(delete_button)
         self.dets_image_dialog = kritter.Kdialog(title="", layout=self.dets_dialog_image, left_footer=copy_button, size="xl")
 
@@ -836,7 +790,7 @@ class ObjectDetector:
             kritter.save_metadata(new_filename_fullpath, new_data)
             self.select_kimage.data['copy'] = new_filename
             kritter.save_metadata(self.select_kimage.fullpath, self.select_kimage.data)
-            return copy_button.out_name("Copied") + copy_button.out_disabled(True)
+            return copy_button.out_name([kritter.Kritter.icon("copy"), "Copied"]) + copy_button.out_disabled(True)
 
         @delete_button.callback()
         def func():
@@ -851,9 +805,9 @@ class ObjectDetector:
         def func(state):
             if state:
                 if 'copy' in self.select_kimage.data and os.path.exists(os.path.join(self.project_training_dir, self.select_kimage.data['copy'])):
-                    return copy_button.out_name("Copied") + copy_button.out_disabled(True)
+                    return copy_button.out_name([kritter.Kritter.icon("copy"), "Copied"]) + copy_button.out_disabled(True)
                 else:
-                    return copy_button.out_name("Copy image to training set") + copy_button.out_disabled(False)                   
+                    return copy_button.out_name([kritter.Kritter.icon("copy"), "Copy image to training set"]) + copy_button.out_disabled(False)                   
 
         return self.dets_image_dialog
 
@@ -867,12 +821,17 @@ class ObjectDetector:
 
         @self.save_button.callback()
         def func():
+            if 'defs' in self.select_kimage.data:
+                self.select_kimage.data['defs'].extend(self.select_kimage.data['predefs'])
+            else:
+                self.select_kimage.data['defs'] = self.select_kimage.data['predefs']
             kritter.save_metadata(self.select_kimage.fullpath, self.select_kimage.data)
             return self.training_grid.render(self.select_kimage, self.select_kimage.data, 0.33) + self.training_image_dialog.out_open(False)
 
         @clear_button.callback()
         def func():
             self.training_dialog_image.overlay.draw_clear()
+            self.select_kimage.data['predefs'] = []
             self.select_kimage.data['defs'] = []
             return self.training_dialog_image.overlay.out_draw() + self.save_button.out_disabled(False)
 
@@ -887,24 +846,21 @@ class ObjectDetector:
 
         @self.training_dialog_image.overlay.callback_draw()
         def func(shape):
-            self.select_box = [shape['x0'], shape['y0'], shape['x1'], shape['y1']]
+            x = [shape['x0'], shape['x1']]
+            y = [shape['y0'], shape['y1']]            
+            self.select_box = [min(x), min(y), max(x), max(y)]
             return self.label_dialog.out_open(True)
 
         @self.training_image_dialog.callback_view()
         def func(state):
-            if not state:
-                return self.save_button.out_disabled(True) 
+            self.select_kimage.data['predefs'] = []
+            return self.save_button.out_disabled(True) 
 
         return self.training_image_dialog
 
     def _create_test_image_dialog(self):
         self.test_dialog_image = kritter.Kimage(overlay=True, service=None)
         self.test_image_dialog = kritter.Kdialog(title="", layout=self.test_dialog_image, size="xl")
-
-        @self.training_image_dialog.callback_view()
-        def func(state):
-            if not state:
-                return self.save_button.out_disabled(True) 
 
         return self.test_image_dialog
 
@@ -925,10 +881,7 @@ class ObjectDetector:
                 mods += self.class_select.out_options(self.classes)
 
             def_ = {'class': class_textbox, 'box': self.select_box}
-            try:
-                self.select_kimage.data['defs'].append(def_)
-            except KeyError:
-                self.select_kimage.data['defs'] = [def_]
+            self.select_kimage.data['predefs'].append(def_)
             mods += self.training_grid.render(self.training_dialog_image, self.select_kimage.data, 0.5)
             return mods + self.save_button.out_disabled(False) + self.label_dialog.out_open(False)
 
@@ -949,9 +902,9 @@ class ObjectDetector:
 
     def _create_train_dialog(self):
         # Create train dialog
-        self.upload_button = kritter.Kbutton(name=[kritter.Kritter.icon("cloud-upload"), "Upload training data"], spinner=True, )
+        self.upload_button = kritter.Kbutton(name=[kritter.Kritter.icon("cloud-upload"), "Upload training data"], spinner=True)
         self.train_button = kritter.Kbutton(name=[kritter.Kritter.icon("train"), "Train"], spinner=True, target="_blank", external_link=True)
-        self.download_button = kritter.Kbutton(name=[kritter.Kritter.icon("cloud-download"), "Download network"], spinner=True)
+        self.download_button = kritter.Kbutton(name=[kritter.Kritter.icon("cloud-download"), "Download model"], spinner=True)
         self.upload_button.append(self.train_button)
         self.upload_button.append(self.download_button)
         self.train_status = kritter.Ktext(style={"control_width": 8})
@@ -986,26 +939,36 @@ class ObjectDetector:
 
                 return self.train_status.out_value(message) + self.download_button.out_spinner_disp(False) + mods
             except Exception as e:
-                return self.train_status.out_value(f'Unable to download. ("{e}")') + self.download_button.out_spinner_disp(False)
+                return self.train_status.out_value(f'Unable to download. ({e})') + self.download_button.out_spinner_disp(False)
 
         return self.train_dialog
+
 
     def _install_next_model(self, model):
         # rename/copy model files
         next_model_base = self.next_model()
         next_model = f'{os.path.join(self.project_models_dir, next_model_base)}.tflite' 
-        os.system(f"mv '{model}' '{next_model}'")
+        os.system(f"cp '{model}' '{next_model}'")
         model_info = kritter.file_basename(model)+".json"
-        next_model_info = f'{os.path.join(self.current_project_dir, next_model_base)}.json' 
+        next_model_info = f'{os.path.join(self.project_models_dir, next_model_base)}.json' 
         os.system(f"cp '{model_info}' '{next_model_info}'")
         # copy model files back to gdrive
         g_next_model = f'{os.path.join(self.project_gdrive_models_dir, next_model_base)}.tflite'
         g_next_model_info = f'{os.path.join(self.project_gdrive_models_dir, next_model_base)}.json'
+        # Copy models back to Gdrive
         try:
             self.gdrive_interface.copy_to(next_model, g_next_model, True)
             self.gdrive_interface.copy_to(next_model_info, g_next_model_info, True)
         except Exception as e:
             print("Unable to copy models to gdrive:", e)
+        # Copy potentially modified script back to local project directory
+        try:
+            train_file = os.path.join(self.current_project_dir, TRAIN_FILE)
+            g_train_file = os.path.join(self.project_gdrive_dir, TRAIN_FILE)
+            self.gdrive_interface.copy_from(g_train_file, train_file)
+        except Exception as e:
+            print("Unable to copy script from gdrive:", e)
+
         # annotate train and validation files
         train_images = glob.glob(os.path.join(self.current_project_dir, "tmp", "train", "*.jpg"))
         train_images = [os.path.basename(i) for i in train_images]
@@ -1026,8 +989,8 @@ class ObjectDetector:
                 data['validate'].append(next_model)
                 kritter.save_metadata(i, data)
 
-    def get_projects(self, exclude_current):
-        plist = glob.glob(os.path.join(self.project_dir, '*', 'project.json'))
+    def get_projects(self, exclude_current=False):
+        plist = glob.glob(os.path.join(self.project_dir, '*', PROJECT_CONFIG_FILE))
         plist = [os.path.basename(os.path.dirname(i)) for i in plist]
         if exclude_current:
             plist.remove(self.app_config['project'])
@@ -1046,6 +1009,7 @@ class ObjectDetector:
 
     def _create_open_project_dialog(self):             
         self.open_project_dialog = OpenProjectDialog(self.get_projects)
+
         @self.open_project_dialog.callback_project()
         def func(project, delete):
             if delete:
@@ -1058,13 +1022,61 @@ class ObjectDetector:
         return self.open_project_dialog 
 
     def _create_new_project_dialog(self):
-        self.new_project_dialog = NewSaveAsDialog(self.get_projects)
+        self.new_project_dialog = NewProjectDialog(self.get_projects)
         @self.new_project_dialog.callback_project()
         def func(project):
             self.app_config['project'] = project
             self.app_config.save()
             return self._open_project()
         return self.new_project_dialog 
+
+    def _create_import_project_dialog(self):
+        self.import_project_dialog = ImportProjectDialog(self.gdrive_interface, self.project_dir, SHARE_KEY_TYPE)
+
+        @self.import_project_dialog.callback()
+        def func(project_name):
+            # open imported project
+            self.app_config['project'] = project_name 
+            return self._open_project()
+
+        return self.import_project_dialog
+
+    def _create_export_project_dialog(self):
+        def file_info_func():
+            return {
+                "project_name": self.app_config['project'], 
+                "project_dir": self.current_project_dir, 
+                "files": ["project.json", f"{self.app_config['project']}.json", f"{self.app_config['project']}.tflite", "training", "models"], 
+                "gdrive_dir": self.project_gdrive_dir
+            }
+
+        self.export_project_dialog = ExportProjectDialog(self.gdrive_interface, SHARE_KEY_TYPE, file_info_func)
+
+        return self.export_project_dialog
+
+    def _create_import_photos_dialog(self):
+        def dest_dir():
+            return self.project_training_dir
+
+        def file_func(filename):
+            filename_fullpath = os.path.join(self.project_training_dir, filename)
+            new_filename_fullpath = os.path.join(self.project_training_dir, kritter.date_stamped_file("jpg"))
+            try:
+                height, width, _ = cv2.imread(filename_fullpath).shape
+            except:
+                os.remove(filename_fullpath)
+                return 
+            os.rename(filename_fullpath, new_filename_fullpath)
+            new_data = {"defs": [], "width": width, "height": height}
+            kritter.save_metadata(new_filename_fullpath, new_data)
+
+        self.import_photos_dialog = ImportPhotosDialog(self.gphoto_interface, dest_dir, file_func)
+
+        @self.import_photos_dialog.callback()
+        def func():
+            return self._tab_func('Training set')
+
+        return self.import_photos_dialog
 
     def _infer_helper(self, detector, index, grid, images_and_data):
         res = False
@@ -1078,7 +1090,10 @@ class ObjectDetector:
                 except KeyError:
                     pass
             res = True
-            image = cv2.imread(os.path.join(grid.media_dir, image))
+            try:
+                image = cv2.imread(os.path.join(grid.media_dir, image))
+            except:
+                continue
             dets = detector.detect(image, self.model_threshold)
             with self.data_lock:
                 if 'tmp' not in data:
@@ -1086,8 +1101,6 @@ class ObjectDetector:
                 if 'dets' not in data['tmp']:
                     data['tmp']['dets'] = {}
                 data['tmp']['dets'][index] = dets
-        if res:
-            print("** inferred")
         return res
 
     def _run_model(self, index, grid, reset):
@@ -1158,7 +1171,7 @@ class ObjectDetector:
 
             if index<len(self.model_menus)-1:
                 # Create a set of options that haven't been selected yet
-                options = [os.path.basename(m) for m in self.models]
+                options = self.model_options.copy()
                 for i in range(index+1):
                     options.remove(self.model_menus[i].value)  
                 if options: # don't bother if there are no more left
@@ -1169,15 +1182,14 @@ class ObjectDetector:
         return func
 
     def _reset_model_menus(self):
-        models = [os.path.basename(m) for m in self.models]
-        return self.model_menus[0].out_disp(True) + self.model_menus[0].out_value(models[0]) + self.model_menus[0].out_options(models)
+        return self.model_menus[0].out_disp(True) + self.model_menus[0].out_options(self.model_options) + self.model_menus[0].out_value(self.model_options[0]) 
 
     def _create_tabs(self):
         # Create video component and histogram enable.
         self.video = kritter.Kvideo(width=self.camera.resolution[0], overlay=True)
         brightness = kritter.Kslider(name="Brightness", value=self.camera.brightness, mxs=(0, 100, 1), format=lambda val: f'{val}%', style={"control_width": 4}, grid=False)
-        self.media_queue =  MediaDisplayQueue(None, STREAM_WIDTH, CAMERA_WIDTH, self.config_consts.MEDIA_QUEUE_IMAGE_WIDTH, self.config_consts.IMAGES_DISPLAY, disp=self.app_config['tracking']) 
-        self.capture_queue =  MediaDisplayQueue(None, STREAM_WIDTH, CAMERA_WIDTH, self.config_consts.MEDIA_QUEUE_IMAGE_WIDTH, self.config_consts.IMAGES_DISPLAY) 
+        self.media_queue = MediaDisplayQueue(None, STREAM_WIDTH, CAMERA_WIDTH, self.config_consts.MEDIA_QUEUE_IMAGE_WIDTH, self.config_consts.IMAGES_DISPLAY, disp=self.app_config['tracking']) 
+        self.capture_queue = MediaDisplayQueue(None, STREAM_WIDTH, CAMERA_WIDTH, self.config_consts.MEDIA_QUEUE_IMAGE_WIDTH, self.config_consts.IMAGES_DISPLAY) 
         self.take_picture_button = kritter.Kbutton(name=[kritter.Kritter.icon("camera"), "Take picture"], service=None, spinner=True)
         colors = [[255, 0, 0, 0.5], [0, 255, 0, 0.5]] 
 
@@ -1199,7 +1211,12 @@ class ObjectDetector:
                 if self.tab=="Training set":
                     data_['timestamp'] = f"{texts[0]}, {texts[1]}" if texts[1] else texts[0]
             else:
-                dets = data['defs'] if 'defs' in data else data['dets']
+                dets = []
+                for i in ['dets', 'defs', 'predefs']:
+                    try: 
+                        dets += data[i]
+                    except:
+                        pass
                 data_ = {'width': data['width'], 'height': data['height'], 'dets': dets}
                 try:
                     data_['timestamp'] = data['timestamp']
@@ -1216,7 +1233,7 @@ class ObjectDetector:
         self.dets_grid = MediaDisplayGrid(None, data_func=data_func, label_func=lambda key, det : f"{det['class']} {det['score']*100:.0f}%")
         self.training_grid = MediaDisplayGrid(None, data_func=data_func, label_func=label_func)
         self.test_model_checkbox = kritter.Kcheckbox(name="Test models", grid=False, value=False)
-        self.model_menus = [kritter.Kdropdown(name="", grid=False, placeholder="Select model", spinner=True) for i in range(MODEL_MENUS)]
+        self.model_menus = [kritter.Kdropdown(name="", grid=False, placeholder="Select model", spinner=True, style={"control_width": 10}) for i in range(MODEL_MENUS)]
         self.model_legends = [html.Div(html.Div(style={"margin": "10px", "width": "20px", "height": "20px", "background-color": f"rgba({colors[i][0]}, {colors[i][1]}, {colors[i][2]}, {colors[i][3]}"}), id=self.kapp.new_id(), style={'display': 'none'}) for i in range(MODEL_MENUS)]
         for i, m in enumerate(self.model_menus):
             m.cols.append(self.model_legends[i])
@@ -1332,16 +1349,18 @@ class ObjectDetector:
             if self.test_models:
                 return self.test_dialog_image.out_src(kimage.path) + self.test_image_dialog.out_title(title) + self.test_image_dialog.out_open(True) + self.training_grid.render(self.test_dialog_image, kimage.data, scale=0.5)
             else:
-                self.training_dialog_image.overlay.draw_user("rect")
+                self.training_dialog_image.overlay.draw_user("rect", fillcolor="rgba(0,0,0,0)")
                 return self.training_dialog_image.out_src(kimage.path) + self.training_image_dialog.out_title(title) + self.training_image_dialog.out_open(True) + self.training_grid.render(self.training_dialog_image, kimage.data, scale=0.5)
 
         @self.dets_grid.callback_render()
         def func():
-            self._infer_test_models()
+            if self.test_models:
+                self._infer_test_models()
 
         @self.training_grid.callback_render()
         def func():
-            self._infer_test_models()
+            if self.test_models:
+                self._infer_test_models()
 
         @brightness.callback()
         def func(value):
@@ -1386,7 +1405,6 @@ class ObjectDetector:
 
     # Frame grabbing thread
     def grab_thread(self):
-        print("**** starting thread", self.run_thread)
         last_tag = ""
         while self.run_thread:
             mods = []
@@ -1441,9 +1459,9 @@ class ObjectDetector:
 
             # Sleep to give other threads a boost 
             time.sleep(0.01)
-        print("**** stopping thread")
 
     def _handle_picks(self, frame, dets):
+        mods = []
         picks = self.picker.update(frame, dets)
         # Get regs (new entries) and deregs (deleted entries)
         regs, deregs = self.picker.get_regs_deregs()
@@ -1460,10 +1478,10 @@ class ObjectDetector:
                 if data['class'] in self.project_config['trigger_classes']:
                     event = {**data, 'image': image, 'event_type': 'trigger', "timestamp": timestamp}
                     handle_event(self, event)
-            if deregs:    
-                handle_event(self, {'event_type': 'deregister', 'deregs': deregs})
-            return self.media_queue.out_images()
-        return []       
+            mods = self.media_queue.out_images()
+        if deregs:    
+            handle_event(self, {'event_type': 'deregister', 'deregs': deregs})
+        return mods       
 
     def _filter_dets(self, dets):
         dets = [det for det in dets if det['class'] in self.project_config['enabled_classes']]
